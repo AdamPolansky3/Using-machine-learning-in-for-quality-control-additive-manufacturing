@@ -1,0 +1,311 @@
+# -*- coding: utf-8 -*-
+
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+from collections import Counter
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix
+import gc
+
+# ====== FILES DIRECTIONS  ======
+train_dir = '/content/drive/MyDrive/NOK/Data/train'                       # Training pictures direction
+val_dir   = '/content/drive/MyDrive/NOK/Data/val'                         # Validation pictures direction
+test_dir  = '/content/drive/MyDrive/clasification/trideno'                # Testing pictures direction
+output_dir = '/content/drive/MyDrive/article/vysledky/ConvNeXt_800'       # History of run saves to this direction
+os.makedirs(output_dir, exist_ok=True)
+
+# ====== HYPERPARAMETERS  ======
+batch_size  = 4
+num_epochs  = 50
+num_classes = 2
+num_workers = 4
+phase1_lr   = 1e-4
+phase2_lr   = 1e-5
+patience    = 5
+fixed_size  = 800  
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ====== SEED ======
+#Setting random seed for each run to ensure repetetability 
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# ====== TRANSFORMATION ======
+#Setting pictures input parameters and augmentation
+
+augmentations_block = transforms.Compose([
+    transforms.RandomVerticalFlip(p=0.66),
+    transforms.RandomRotation(degrees=1.5, fill=0, interpolation=transforms.InterpolationMode.BILINEAR),
+    transforms.RandomAffine(degrees=0, translate=(0.05,0.05), scale=(0.95,1.05)),
+    transforms.ColorJitter(brightness=0.4, contrast=0.2)
+])
+
+train_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((fixed_size, fixed_size)),
+    augmentations_block,
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+])
+val_transform = transforms.Compose([
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((fixed_size, fixed_size)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+])
+
+# ====== DATASET ======
+class ImageFolderWithPaths(datasets.ImageFolder):
+    def __getitem__(self, index):
+        img, label = super().__getitem__(index)
+        path, _ = self.samples[index]
+        return img, label, path
+
+train_dataset = ImageFolderWithPaths(train_dir, transform=train_transform)
+val_dataset   = ImageFolderWithPaths(val_dir, transform=val_transform)
+test_dataset  = ImageFolderWithPaths(test_dir, transform=val_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+class_names = train_dataset.classes
+print(f"Třídy: {class_names}")
+
+# ====== LOSS FUNCTION ======
+class SoftFocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=1.0, reduction='mean', ce_ratio=0.3):
+        super(SoftFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce_ratio = ce_ratio
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == 'mean':
+            focal_loss = focal_loss.mean()
+            ce_loss = ce_loss.mean()
+        elif self.reduction == 'sum':
+            focal_loss = focal_loss.sum()
+            ce_loss = ce_loss.sum()
+        return (1 - self.ce_ratio) * focal_loss + self.ce_ratio * ce_loss
+
+# ====== TRAINING PIPELINE AND EVALUATION ======
+def evaluate(model, loader, criterion):
+    model.eval()
+    loss_sum, correct, total = 0.0, 0, 0
+    with torch.no_grad():
+        for inputs, labels, _ in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss_sum += loss.item() * inputs.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    return loss_sum / total, 100.0 * correct / total
+
+def train_phase(model, train_loader, val_loader, criterion, optimizer,
+                num_epochs, phase_name, save_name, start_epoch=0, patience=3):
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_path = os.path.join(output_dir, save_name)
+    history = []
+
+    print(f"\n {phase_name}")
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
+
+        for inputs, labels, _ in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+        train_loss = running_loss / total
+        train_acc = 100.0 * correct / total
+        val_loss, val_acc = evaluate(model, val_loader, criterion)
+        epoch_idx = start_epoch + epoch + 1
+
+        print(f"Epoch [{epoch_idx}/{start_epoch+num_epochs}] - Train Loss: {train_loss:.4f}, "
+              f"Train Acc: {train_acc:.2f}% - Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}% - LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+        history.append({
+            'epoch': epoch_idx,
+            'phase': phase_name,
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+        })
+
+        # ===== EARLY STOPPING CONDITION =====
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), best_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f" Early stopping po {epoch+1} epochách. Nejlepší Val Loss: {best_val_loss:.4f}")
+                break
+
+    return best_path, history
+
+# ====== SEED SETTING ======
+seeds = [42, 123, 999, 2025, 5555]
+all_results = []
+
+# ======SOFT FOCAL LOSS
+from collections import Counter
+class_counts = Counter([label for _, label in train_dataset.samples])
+total_samples = sum(class_counts.values())
+weights = [total_samples / class_counts[i] for i in range(len(class_counts))]
+weights = torch.tensor(weights, dtype=torch.float, device=device)
+criterion = SoftFocalLoss(alpha=weights, gamma=1.0, ce_ratio=0.3, reduction='mean')
+
+for run_idx, seed in enumerate(seeds):
+    print(f"\n=================== RUN {run_idx+1} (seed={seed}) ===================")
+    set_seed(seed)
+
+    # ====== Model Initialization======
+    model_fn, weights_fn = models.convnext_tiny, models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1
+    model = model_fn(weights=weights_fn)
+    in_features = model.classifier[2].in_features
+    model.classifier[2] = nn.Linear(in_features, num_classes)
+    model = model.to(device)
+
+    #===== TRAINING - PHASE 1 =====
+    for p in model.parameters():
+        p.requires_grad = False
+    if hasattr(model.features[-1], 'blocks'):
+        for p in model.features[-1].parameters():
+            p.requires_grad = True
+    for p in model.classifier.parameters():
+        p.requires_grad = True
+
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=phase1_lr)          #Setting optimizer function
+
+    phase1_best, history_phase1 = train_phase(
+        model, train_loader, val_loader, criterion, optimizer,
+        num_epochs=num_epochs,
+        phase_name="TINY FÁZE 1: classifier+last_block",
+        save_name=f"tiny_run{run_idx+1}_phase1_best.pth",
+        patience=patience
+    )
+
+    # ===== TRAINING - PHASE 2 =====
+    print("\n Začíná PHASE 2: full fine-tuning celé sítě")
+    model.load_state_dict(torch.load(phase1_best, map_location=device))
+
+    for p in model.parameters():
+        p.requires_grad = True
+
+    optimizer = optim.Adam(model.parameters(), lr=phase2_lr)                                             #Setting optimizer function
+
+    phase2_best, history_phase2 = train_phase(
+        model, train_loader, val_loader, criterion, optimizer,
+        num_epochs=num_epochs,
+        phase_name="TINY FÁZE 2: full_finetune",
+        save_name=f"tiny_run{run_idx+1}_phase2_best.pth",
+        start_epoch=len(history_phase1),
+        patience=patience
+    )
+
+    # ===== DATA AGREGATION =====
+    all_history = history_phase1 + history_phase2
+    all_results.append({'seed': seed, 'best_model': phase2_best, 'history': all_history})
+
+    # ===== TEST =====
+    model.load_state_dict(torch.load(phase2_best, map_location=device))
+    test_loss, test_acc = evaluate(model, test_loader, criterion)
+    all_labels, all_preds = [], []
+    with torch.no_grad():
+        for inputs, labels, _ in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            preds = outputs.argmax(dim=1)
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
+    cm = confusion_matrix(all_labels, all_preds)
+    class_report = classification_report(all_labels, all_preds, target_names=class_names)
+    print(f" Test Accuracy: {test_acc:.2f}%")
+    print(cm)
+    print(class_report)
+
+    # ===== SAVING RUN HISTORY =====
+    log_txt_path = os.path.join(output_dir, f"tiny_run{run_idx+1}_history.txt")
+    with open(log_txt_path, 'w', encoding='utf-8') as f:
+        f.write("epoch,phase,train_loss,train_acc,val_loss,val_acc,lr\n")
+        for h in all_history:
+            f.write(f"{h['epoch']},{h['phase']},{h['train_loss']:.4f},{h['train_acc']:.2f},"
+                    f"{h['val_loss']:.4f},{h['val_acc']:.2f},{h['lr']}\n")
+        f.write(f"\nTEST Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%\n")
+        f.write("Confusion Matrix:\n")
+        f.write('Class,' + ','.join(class_names) + '\n')
+        for i, row in enumerate(cm):
+            f.write(f"{class_names[i]}," + ','.join(map(str, row)) + '\n')
+        f.write("\nClassification Report:\n")
+        f.write(class_report + "\n")
+    print(f" Historie uložena do: {log_txt_path}")
+
+    # ===== EVALUATION GRAPHS =====
+    epochs = [h['epoch'] for h in all_history]
+    train_acc = [h['train_acc'] for h in all_history]
+    val_acc = [h['val_acc'] for h in all_history]
+    train_loss = [h['train_loss'] for h in all_history]
+    val_loss = [h['val_loss'] for h in all_history]
+
+    fig, ax1 = plt.subplots(figsize=(10,6))
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Accuracy [%]')
+    ax1.plot(epochs, train_acc, '-', color='tab:blue', label='Train Accuracy')
+    ax1.plot(epochs, val_acc, '-', color='tab:cyan', label='Val Accuracy')
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Loss')
+    ax2.plot(epochs, train_loss, '-', color='tab:red', label='Train Loss')
+    ax2.plot(epochs, val_loss, '-', color='tab:orange', label='Val Loss')
+
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper right')
+    plt.title(f'CONVNEXT-TINY Run {run_idx+1} - Accuracy & Loss')
+    plt.grid(True)
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, f"tiny_run{run_idx+1}_acc_loss.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Graphs saved to: {plot_path}")
+
+    # ===== CLEANING GPU MEMORY =====
+    del model, optimizer
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("GPU memory cleaned")   #kontrola
